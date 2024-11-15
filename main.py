@@ -7,11 +7,19 @@ import sys
 import common
 import common_runtime
 import json
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import MinMaxScaler
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 # TensorRT Logger
 TRT_LOGGER = trt.Logger(trt.Logger.INFO)
 trt.init_libnvinfer_plugins(TRT_LOGGER, "")
+
+tracking_history = {}
+
+MAX_CENTERS = 7
+FRAME_TIMEOUT = 5
 
 CONFIDENCE_THRESHOLD = 0.6
 NMS_THRESHOLD = 0.7
@@ -19,6 +27,32 @@ MODEL_INPUT_SIZE = (640, 640)
 
 # Initialize Deep SORT
 tracker = DeepSort(max_age=30, n_init=3, max_iou_distance=NMS_THRESHOLD)
+
+# Define the LSTM model
+class TrajectoryLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, scaler):
+        super(TrajectoryLSTM, self).__init__()
+        self.hidden_size = hidden_size
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.scaler = scaler
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        output = self.fc(lstm_out)  # Predict all timesteps
+        return output
+
+    def predict(self, x):
+        x = x[0]
+        x = self.scaler.transform(x)
+        x = torch.from_numpy(x).unsqueeze(0).float()
+        # Run the forward pass and denormalize the output
+        output = self.forward(x)[0][-1]
+        # Reshape output for inverse transformation
+        output_reshaped = output.view(-1, 2).cpu().detach().numpy()
+        denormalized_output = self.scaler.inverse_transform(output_reshaped)
+        # Reshape back to original sequence format
+        return denormalized_output.reshape(output.shape)
 
 def get_engine(engine_file_path):
     print("Reading engine from file {}".format(engine_file_path))
@@ -36,6 +70,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", help="File path of TensorRT model.", required=True)
     parser.add_argument('--input_svo_file', type=str, required=True, help='Path to the .svo file')
+    parser.add_argument("--traj_pred_model", type=str, required=True, help='Path to the .pt file')
     parser.add_argument('--resolution', type=str, help='Resolution: HD2K, HD1200, HD1080, HD720, SVGA, VGA',
                         default='HD720')
     return parser.parse_args()
@@ -81,6 +116,14 @@ def main():
     engine = get_engine(args.model)
     context = engine.create_execution_context()
 
+    #output file details
+    output_file = 'output_video.avi'
+    frame_width = 1920
+    frame_height = 1200
+    fps = 30
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Use 'mp4v' for .mp4
+    out = cv2.VideoWriter(output_file, fourcc, fps, (frame_width, frame_height))
+
     # Initialize ZED camera from SVO
     zed = setup_zed_camera(args)
     runtime_parameters = sl.RuntimeParameters()
@@ -88,6 +131,12 @@ def main():
     left_image = sl.Mat()
 
     nb_frames = zed.get_svo_number_of_frames()
+
+    model_state_dict = torch.load(args.traj_pred_model)
+    scaler = model_state_dict['scaler']
+    model = TrajectoryLSTM(2, 128, 2, scaler)
+    model.load_state_dict(model_state_dict['model_state_dict'])
+    model.eval()
 
     trajectory_data = []
 
@@ -149,6 +198,18 @@ def main():
                 bbox = track.to_ltwh()
                 depth = track.get_det_supplementary()
                 x_min, y_min, width, height = bbox.astype("int")
+                center = [int(x_min + width / 2), int(y_min + height / 2)]
+
+                # Update tracking history
+                if track_id not in tracking_history:
+                    tracking_history[track_id] = {
+                        "centers": [],
+                        "last_seen": svo_position
+                    }
+                tracking_history[track_id]["centers"].append(center)
+                tracking_history[track_id]["last_seen"] = svo_position
+                if len(tracking_history[track_id]["centers"]) > MAX_CENTERS:
+                    tracking_history[track_id]["centers"].pop(0)
                 cv2.rectangle(frame_rgb, (x_min, y_min), (x_min + width, y_min + height), (0, 255, 0), 2)
                 cv2.putText(frame_rgb, f"ID {track_id} Depth: {depth}", (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 if depth is None:
@@ -160,10 +221,30 @@ def main():
                 }
                 frame_data["detections"].append(track_data)
 
+            stale_tracks = [tid for tid, data in tracking_history.items() if
+                            svo_position - data["last_seen"] > FRAME_TIMEOUT]
+            for stale_track in stale_tracks:
+                del tracking_history[stale_track]
+
+            can_be_predicted = [data for tid, data in tracking_history.items() if len(data["centers"]) == MAX_CENTERS]
+
+            for data in can_be_predicted:
+                centers = data["centers"]
+                data = torch.from_numpy(np.array(centers)).unsqueeze(0).float()
+                predictions = []
+                for _ in range(10):
+                    pred = model.predict(data)
+                    predictions.append(pred)
+                    data = torch.cat((data[:, 1:, :], torch.from_numpy(pred).unsqueeze(0).unsqueeze(0)), dim=1)
+                predictions = np.array(predictions).squeeze()
+                for prediction in predictions:
+                    cv2.circle(frame_rgb, (int(prediction[0]), int(prediction[1])), 1, (255, 0, 0), 2)
+
             trajectory_data.append(frame_data)
 
             # Display
             cv2.imshow("Detections", frame_rgb)
+            out.write(frame_rgb)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 

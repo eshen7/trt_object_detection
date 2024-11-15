@@ -2,3 +2,5 @@ yolov8n.pt
 yolov8n.trt
 yolov8n.onnx
 esprings.svo2
+trajectory_model.pt
+trajectory_model.pth
