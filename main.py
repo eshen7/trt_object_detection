@@ -6,13 +6,14 @@ import pyzed.sl as sl
 import sys
 import common
 import common_runtime
+import json
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 # TensorRT Logger
 TRT_LOGGER = trt.Logger(trt.Logger.INFO)
 trt.init_libnvinfer_plugins(TRT_LOGGER, "")
 
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.6
 NMS_THRESHOLD = 0.7
 MODEL_INPUT_SIZE = (640, 640)
 
@@ -88,7 +89,10 @@ def main():
 
     nb_frames = zed.get_svo_number_of_frames()
 
-    for svo_position in range(nb_frames):
+    trajectory_data = []
+
+    for svo_position in range(250):
+        frame_data = {"frame": svo_position, "detections": []}
         if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
             zed.retrieve_image(left_image, sl.VIEW.LEFT)
             frame = left_image.get_data()
@@ -147,6 +151,16 @@ def main():
                 x_min, y_min, width, height = bbox.astype("int")
                 cv2.rectangle(frame_rgb, (x_min, y_min), (x_min + width, y_min + height), (0, 255, 0), 2)
                 cv2.putText(frame_rgb, f"ID {track_id} Depth: {depth}", (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                if depth is None:
+                    depth = 100000
+                track_data = {
+                    "track_id": int(track_id),
+                    # "depth": float(depth),
+                    "center": [int(x_min + width / 2), int(y_min + height / 2)]
+                }
+                frame_data["detections"].append(track_data)
+
+            trajectory_data.append(frame_data)
 
             # Display
             cv2.imshow("Detections", frame_rgb)
@@ -155,6 +169,9 @@ def main():
 
         if zed.get_svo_position() >= nb_frames - 1:
             break
+
+    with open("trajectory_data.json", "w") as f:
+        json.dump(trajectory_data, f, indent=4)
 
     # Release resources
     zed.close()
