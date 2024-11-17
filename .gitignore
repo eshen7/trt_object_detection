@@ -4,5 +4,5 @@ yolov8n.onnx
 esprings.svo2
 trajectory_model.pt
 trajectory_model.pth
-trejectory_data.json
+trajectory_data.json
 output_video.avi
