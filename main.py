@@ -46,12 +46,9 @@ class TrajectoryLSTM(nn.Module):
         x = x[0]
         x = self.scaler.transform(x)
         x = torch.from_numpy(x).unsqueeze(0).float()
-        # Run the forward pass and denormalize the output
         output = self.forward(x)[0][-1]
-        # Reshape output for inverse transformation
         output_reshaped = output.view(-1, 2).cpu().detach().numpy()
         denormalized_output = self.scaler.inverse_transform(output_reshaped)
-        # Reshape back to original sequence format
         return denormalized_output.reshape(output.shape)
 
 def get_engine(engine_file_path):
@@ -212,11 +209,8 @@ def main():
                     tracking_history[track_id]["centers"].pop(0)
                 cv2.rectangle(frame_rgb, (x_min, y_min), (x_min + width, y_min + height), (0, 255, 0), 2)
                 cv2.putText(frame_rgb, f"ID {track_id} Depth: {depth}", (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                if depth is None:
-                    depth = 100000
                 track_data = {
                     "track_id": int(track_id),
-                    # "depth": float(depth),
                     "center": [int(x_min + width / 2), int(y_min + height / 2)]
                 }
                 frame_data["detections"].append(track_data)
