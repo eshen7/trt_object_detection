@@ -21,8 +21,8 @@ tracking_history = {}
 MAX_CENTERS = 7
 FRAME_TIMEOUT = 5
 
-CONFIDENCE_THRESHOLD = 0.6
-NMS_THRESHOLD = 0.7
+CONFIDENCE_THRESHOLD = 0.5
+NMS_THRESHOLD = 0.4
 MODEL_INPUT_SIZE = (640, 640)
 
 # Initialize Deep SORT
@@ -43,9 +43,9 @@ class TrajectoryLSTM(nn.Module):
         return output
 
     def predict(self, x):
-        x = x[0]
-        x = self.scaler.transform(x)
-        x = torch.from_numpy(x).unsqueeze(0).float()
+        # x = x[0]
+        # x = self.scaler.transform(x)
+        # x = torch.from_numpy(x).unsqueeze(0).float()
         output = self.forward(x)[0][-1]
         output_reshaped = output.view(-1, 2).cpu().detach().numpy()
         denormalized_output = self.scaler.inverse_transform(output_reshaped)
@@ -134,10 +134,14 @@ def main():
     model = TrajectoryLSTM(2, 128, 2, scaler)
     model.load_state_dict(model_state_dict['model_state_dict'])
     model.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
     trajectory_data = []
 
-    for svo_position in range(250):
+    inputs, outputs, bindings, stream = common.allocate_buffers(engine)
+
+    for svo_position in range(nb_frames):
         frame_data = {"frame": svo_position, "detections": []}
         if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
             zed.retrieve_image(left_image, sl.VIEW.LEFT)
@@ -147,17 +151,17 @@ def main():
             normalized_im = normalize(resized_im)
 
             # Inference
-            inputs, outputs, bindings, stream = common.allocate_buffers(engine)
-            inputs[0].host = np.ascontiguousarray(normalized_im)
-            outputs = common_runtime.do_inference(
+            np.copyto(inputs[0].host, normalized_im.ravel())
+            # inputs[0].host = np.ascontiguousarray(normalized_im)
+            output = common_runtime.do_inference(
                 context, engine=engine, bindings=bindings, inputs=inputs, outputs=outputs, stream=stream
             )
 
             h, w = MODEL_INPUT_SIZE
-            outputs = outputs[0].reshape((1, 84, 8400))[0].transpose()
+            output = output[0].reshape((1, 84, 8400))[0].transpose()
 
             boxes, confidences, class_ids, depths = [], [], [], []
-            for detection in outputs:
+            for detection in output:
                 confidence = np.max(detection[4:])
                 if confidence < CONFIDENCE_THRESHOLD:
                     continue
@@ -225,14 +229,19 @@ def main():
             for data in can_be_predicted:
                 centers = data["centers"]
                 data = torch.from_numpy(np.array(centers)).unsqueeze(0).float()
-                predictions = []
-                for _ in range(10):
-                    pred = model.predict(data)
-                    predictions.append(pred)
-                    data = torch.cat((data[:, 1:, :], torch.from_numpy(pred).unsqueeze(0).unsqueeze(0)), dim=1)
-                predictions = np.array(predictions).squeeze()
-                for prediction in predictions:
-                    cv2.circle(frame_rgb, (int(prediction[0]), int(prediction[1])), 1, (255, 0, 0), 2)
+                with torch.no_grad():
+                    predictions = []
+                    for _ in range(10):
+                        x = data[0]
+                        x = scaler.transform(x)
+                        x = torch.from_numpy(x).unsqueeze(0).float()
+                        x = x.to(device)
+                        pred = model.predict(x)
+                        predictions.append(pred)
+                        data = torch.cat((data[:, 1:, :], torch.from_numpy(pred).unsqueeze(0).unsqueeze(0)), dim=1)
+                    predictions = np.array(predictions).squeeze()
+                    for prediction in predictions:
+                        cv2.circle(frame_rgb, (int(prediction[0]), int(prediction[1])), 1, (255, 0, 0), 2)
 
             trajectory_data.append(frame_data)
 
